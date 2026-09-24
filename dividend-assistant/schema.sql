@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS dividend_events (
     cash_percent REAL,
     total_percent REAL,
     status TEXT NOT NULL CHECK (status IN (
+        'UNKNOWN',
         'RUMORED',
         'PROPOSED',
         'REGULATORY_APPROVED',
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS source_evidence (
     observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     raw_excerpt TEXT,
     source_rank INTEGER NOT NULL DEFAULT 5,
+    source_fingerprint TEXT UNIQUE,
     FOREIGN KEY (dividend_event_id) REFERENCES dividend_events(id)
 );
 
