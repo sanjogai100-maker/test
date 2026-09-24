@@ -12,9 +12,21 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "dividends.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
 
+STATUS_RANK = {
+    "UNKNOWN": 0,
+    "RUMORED": 1,
+    "PROPOSED": 2,
+    "REGULATORY_APPROVED": 3,
+    "AGM_ANNOUNCED": 4,
+    "BOOK_CLOSE_ANNOUNCED": 5,
+    "AGM_APPROVED": 6,
+    "DISTRIBUTED": 7,
+    "CANCELLED": 99,
+}
+
 app = FastAPI(
     title="NEPSE Dividend Assistant API",
-    version="0.2.0",
+    version="0.3.0",
     description="Canonical dividend-event store for an AI assistant.",
 )
 
@@ -65,7 +77,7 @@ class DividendEventIn(BaseModel):
     book_close_date: Optional[str] = None
     effective_date: Optional[str] = None
     notes: Optional[str] = None
-    sources: list[SourceEvidenceIn] = []
+    sources: list[SourceEvidenceIn] = Field(default_factory=list)
 
 
 def source_fingerprint(event_id: int, source: SourceEvidenceIn) -> str:
@@ -79,6 +91,16 @@ def source_fingerprint(event_id: int, source: SourceEvidenceIn) -> str:
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def merge_status(existing: Optional[str], incoming: str) -> str:
+    if incoming == "CANCELLED":
+        return incoming
+    if existing == "CANCELLED":
+        return existing
+    if existing is None:
+        return incoming
+    return incoming if STATUS_RANK[incoming] >= STATUS_RANK[existing] else existing
 
 
 def event_to_dict(row: sqlite3.Row, sources: list[dict]) -> dict:
@@ -155,6 +177,20 @@ def upsert_dividend(payload: DividendEventIn) -> dict:
                 (payload.company_name, payload.sector, company_id),
             )
 
+        existing = conn.execute(
+            """
+            SELECT status
+            FROM dividend_events
+            WHERE company_id = ? AND fiscal_year = ?
+            """,
+            (company_id, payload.fiscal_year),
+        ).fetchone()
+
+        resolved_status = merge_status(
+            existing["status"] if existing else None,
+            payload.status,
+        )
+
         conn.execute(
             """
             INSERT INTO dividend_events(
@@ -167,10 +203,7 @@ def upsert_dividend(payload: DividendEventIn) -> dict:
                 bonus_percent = COALESCE(excluded.bonus_percent, dividend_events.bonus_percent),
                 cash_percent = COALESCE(excluded.cash_percent, dividend_events.cash_percent),
                 total_percent = COALESCE(excluded.total_percent, dividend_events.total_percent),
-                status = CASE
-                    WHEN excluded.status = 'UNKNOWN' THEN dividend_events.status
-                    ELSE excluded.status
-                END,
+                status = excluded.status,
                 announcement_date = COALESCE(excluded.announcement_date, dividend_events.announcement_date),
                 agm_date = COALESCE(excluded.agm_date, dividend_events.agm_date),
                 book_close_date = COALESCE(excluded.book_close_date, dividend_events.book_close_date),
@@ -184,7 +217,7 @@ def upsert_dividend(payload: DividendEventIn) -> dict:
                 bonus,
                 cash,
                 total,
-                payload.status,
+                resolved_status,
                 payload.announcement_date,
                 payload.agm_date,
                 payload.book_close_date,
@@ -227,7 +260,12 @@ def upsert_dividend(payload: DividendEventIn) -> dict:
 
         conn.commit()
 
-    return {"ok": True, "symbol": symbol, "fiscal_year": payload.fiscal_year}
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "fiscal_year": payload.fiscal_year,
+        "status": resolved_status,
+    }
 
 
 @app.get("/dividends/latest/{symbol}")
