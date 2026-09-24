@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,7 @@ SCHEMA_PATH = BASE_DIR / "schema.sql"
 
 app = FastAPI(
     title="NEPSE Dividend Assistant API",
-    version="0.1.0",
+    version="0.2.0",
     description="Canonical dividend-event store for an AI assistant.",
 )
 
@@ -53,10 +54,11 @@ class DividendEventIn(BaseModel):
     cash_percent: Optional[float] = Field(default=None, ge=0)
     total_percent: Optional[float] = Field(default=None, ge=0)
     status: str = Field(
+        default="UNKNOWN",
         pattern=(
-            "^(RUMORED|PROPOSED|REGULATORY_APPROVED|AGM_ANNOUNCED|"
+            "^(UNKNOWN|RUMORED|PROPOSED|REGULATORY_APPROVED|AGM_ANNOUNCED|"
             "BOOK_CLOSE_ANNOUNCED|AGM_APPROVED|DISTRIBUTED|CANCELLED)$"
-        )
+        ),
     )
     announcement_date: Optional[str] = None
     agm_date: Optional[str] = None
@@ -64,6 +66,19 @@ class DividendEventIn(BaseModel):
     effective_date: Optional[str] = None
     notes: Optional[str] = None
     sources: list[SourceEvidenceIn] = []
+
+
+def source_fingerprint(event_id: int, source: SourceEvidenceIn) -> str:
+    payload = "|".join(
+        [
+            str(event_id),
+            source.source_name,
+            source.source_url or "",
+            source.published_at or "",
+            source.raw_excerpt or "",
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def event_to_dict(row: sqlite3.Row, sources: list[dict]) -> dict:
@@ -82,6 +97,7 @@ def event_to_dict(row: sqlite3.Row, sources: list[dict]) -> dict:
         "book_close_date": row["book_close_date"],
         "effective_date": row["effective_date"],
         "notes": row["notes"],
+        "source_count": len(sources),
         "sources": sources,
     }
 
@@ -102,7 +118,7 @@ def get_sources(conn: sqlite3.Connection, event_id: int) -> list[dict]:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True}
+    return {"ok": True, "database": str(DB_PATH)}
 
 
 @app.post("/dividends")
@@ -148,10 +164,13 @@ def upsert_dividend(payload: DividendEventIn) -> dict:
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(company_id, fiscal_year) DO UPDATE SET
-                bonus_percent = excluded.bonus_percent,
-                cash_percent = excluded.cash_percent,
-                total_percent = excluded.total_percent,
-                status = excluded.status,
+                bonus_percent = COALESCE(excluded.bonus_percent, dividend_events.bonus_percent),
+                cash_percent = COALESCE(excluded.cash_percent, dividend_events.cash_percent),
+                total_percent = COALESCE(excluded.total_percent, dividend_events.total_percent),
+                status = CASE
+                    WHEN excluded.status = 'UNKNOWN' THEN dividend_events.status
+                    ELSE excluded.status
+                END,
                 announcement_date = COALESCE(excluded.announcement_date, dividend_events.announcement_date),
                 agm_date = COALESCE(excluded.agm_date, dividend_events.agm_date),
                 book_close_date = COALESCE(excluded.book_close_date, dividend_events.book_close_date),
@@ -184,13 +203,15 @@ def upsert_dividend(payload: DividendEventIn) -> dict:
         event_id = event["id"]
 
         for source in payload.sources:
+            fingerprint = source_fingerprint(event_id, source)
             conn.execute(
                 """
-                INSERT INTO source_evidence(
+                INSERT OR IGNORE INTO source_evidence(
                     dividend_event_id, source_name, source_type,
-                    source_url, published_at, raw_excerpt, source_rank
+                    source_url, published_at, raw_excerpt, source_rank,
+                    source_fingerprint
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -200,6 +221,7 @@ def upsert_dividend(payload: DividendEventIn) -> dict:
                     source.published_at,
                     source.raw_excerpt,
                     source.source_rank,
+                    fingerprint,
                 ),
             )
 
